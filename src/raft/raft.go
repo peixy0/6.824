@@ -91,6 +91,9 @@ type Raft struct {
 	lastApplied int
 	nextIndex   []int
 	matchIndex  []int
+
+	snapshotIndex int
+	snapshotTerm  int
 }
 
 // return currentTerm and whether this server
@@ -268,16 +271,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	ok, term := rf.matchPrevIndexAndTerm(args.PrevLogIndex, args.PrevLogTerm)
 	if !ok {
 		reply.Term = term
+		log.Printf("%v <- %v: reject AppendEntries: log = %v", args.LeaderId, rf.me, rf.log)
 		log.Printf("%v <- %v: reject AppendEntries: prevLogTerm = %v", args.LeaderId, rf.me, term)
 		return
 	}
 	reply.Success = true
 	if len(args.Entries) > 0 {
-		rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
+		rf.updateLog(args.PrevLogIndex, args.Entries)
 		rf.persist()
-		log.Printf("%v update log: %v", rf.me, rf.log)
 	}
-	rf.lastApplied = len(rf.log) - 1
 	rf.commitTo(args.LeaderCommit)
 	go rf.nextElection()
 	log.Printf("%v <- %v: ack AppendEntries", args.LeaderId, rf.me)
@@ -313,30 +315,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 // the struct itself.
 //
 
-func timedCall(fn func() bool, d time.Duration) bool {
-	ch := make(chan bool)
-	go func() {
-		ch <- fn()
-	}()
-	ok := false
-	t := time.NewTimer(d)
-	select {
-	case ok = <-ch:
-	case <-t.C:
-	}
-	return ok
-}
-
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	return timedCall(func() bool {
-		return rf.peers[server].Call("Raft.RequestVote", args, reply)
-	}, 500*time.Millisecond)
+	return rf.peers[server].Call("Raft.RequestVote", args, reply)
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	return timedCall(func() bool {
-		return rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	}, 500*time.Millisecond)
+	return rf.peers[server].Call("Raft.AppendEntries", args, reply)
 }
 
 //
@@ -399,11 +383,35 @@ func (rf *Raft) unlock() {
 	rf.mu.Unlock()
 }
 
+func (rf *Raft) getLogEntry(index int) *RaftLog {
+	if index < 0 || index > rf.lastApplied {
+		log.Printf("%v log[%v] does not exist", rf.me, index)
+		return nil
+	}
+	if index <= rf.snapshotIndex {
+		log.Printf("%v log[%v] is already discarded", rf.me, index)
+		return nil
+	}
+	return &rf.log[index-rf.snapshotIndex-1]
+}
+
+func (rf *Raft) updateLog(prevLogIndex int, entries []RaftLog) {
+	d := 0
+	if prevLogIndex < rf.snapshotIndex {
+		d = rf.snapshotIndex - prevLogIndex
+		prevLogIndex = rf.snapshotIndex
+		entries = entries[d:]
+	}
+	rf.log = append(rf.log[:prevLogIndex-rf.snapshotIndex], entries...)
+	rf.lastApplied = len(rf.log) + rf.snapshotIndex
+	log.Printf("%v updated log: %v", rf.me, rf.log)
+}
+
 func (rf *Raft) atLeastUpToDate(index int, term int) bool {
 	if rf.lastApplied < 0 {
 		return true
 	}
-	currentTerm := rf.log[rf.lastApplied].Term
+	currentTerm := rf.getLogEntry(rf.lastApplied).Term
 	if currentTerm == term {
 		return rf.lastApplied <= index
 	}
@@ -411,11 +419,11 @@ func (rf *Raft) atLeastUpToDate(index int, term int) bool {
 }
 
 func (rf *Raft) matchPrevIndexAndTerm(index int, term int) (bool, int) {
-	if index < 0 {
+	if index <= rf.snapshotIndex {
 		return true, 0
 	}
 	if index <= rf.lastApplied {
-		currentTerm := rf.log[index].Term
+		currentTerm := rf.getLogEntry(index).Term
 		minTerm := term
 		if minTerm > currentTerm {
 			minTerm = currentTerm
@@ -425,16 +433,16 @@ func (rf *Raft) matchPrevIndexAndTerm(index int, term int) (bool, int) {
 	if rf.lastApplied < 0 {
 		return false, -1
 	}
-	return false, rf.log[rf.lastApplied].Term
+	return false, rf.getLogEntry(rf.lastApplied).Term
 }
 
 func (rf *Raft) commitTo(index int) {
 	for rf.commitIndex < index {
 		rf.commitIndex++
-		log.Printf("%v commit %v:%v", rf.me, rf.commitIndex, rf.log[rf.commitIndex])
+		log.Printf("%v commit %v: %v", rf.me, rf.commitIndex, rf.getLogEntry(rf.commitIndex))
 		rf.applyCh <- ApplyMsg{
 			CommandValid: true,
-			Command:      rf.log[rf.commitIndex].Command,
+			Command:      rf.getLogEntry(rf.commitIndex).Command,
 			CommandIndex: rf.commitIndex + 1,
 		}
 	}
@@ -444,7 +452,7 @@ func (rf *Raft) tryToCommit() {
 	i := rf.lastApplied
 	nRequired := len(rf.peers)/2 + 1
 	for i > rf.commitIndex {
-		if rf.log[i].Term != rf.currentTerm {
+		if rf.getLogEntry(i).Term != rf.currentTerm {
 			return
 		}
 		nMatched := 1
@@ -521,10 +529,18 @@ func (rf *Raft) collectHeartbeatFromPeer(term int, peer int) {
 		if rf.killed() || rf.currentTerm != term {
 			return
 		}
-		prevLogTerm := -1
 		prevLogIndex := rf.nextIndex[peer] - 1
-		if prevLogIndex >= 0 {
-			prevLogTerm = rf.log[prevLogIndex].Term
+		if prevLogIndex < rf.snapshotIndex {
+			log.Printf("%v -> %v: peer too far behind, install snapshot here", rf.me, peer)
+			return
+		}
+		prevLogTerm := rf.snapshotTerm
+		if prevLogIndex > rf.snapshotIndex {
+			prevLogTerm = rf.getLogEntry(prevLogIndex).Term
+		}
+		var entries []RaftLog
+		for i := rf.nextIndex[peer]; i <= rf.lastApplied; i++ {
+			entries = append(entries, *rf.getLogEntry(i))
 		}
 		args := &AppendEntriesArgs{
 			Term:         term,
@@ -532,7 +548,7 @@ func (rf *Raft) collectHeartbeatFromPeer(term int, peer int) {
 			PrevLogIndex: prevLogIndex,
 			PrevLogTerm:  prevLogTerm,
 			LeaderCommit: rf.commitIndex,
-			Entries:      rf.log[rf.nextIndex[peer]:],
+			Entries:      entries,
 		}
 		var reply AppendEntriesReply
 		rf.unlock()
@@ -554,7 +570,7 @@ func (rf *Raft) collectHeartbeatFromPeer(term int, peer int) {
 		}
 		if !reply.Success {
 			i := rf.nextIndex[peer] - 1
-			for i > 0 && rf.log[i].Term >= reply.Term {
+			for i > rf.snapshotIndex+1 && rf.getLogEntry(i).Term >= reply.Term {
 				i--
 			}
 			rf.nextIndex[peer] = i
@@ -645,7 +661,7 @@ func (rf *Raft) collectVotes(term int) {
 	ch := make(chan *RequestVoteReply, len(rf.peers)-1)
 	lastLogTerm := -1
 	if rf.lastApplied >= 0 {
-		lastLogTerm = rf.log[rf.lastApplied].Term
+		lastLogTerm = rf.getLogEntry(rf.lastApplied).Term
 	}
 	args := &RequestVoteArgs{
 		Term:         rf.currentTerm,
@@ -690,7 +706,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commitIndex = -1
 	rf.lastApplied = -1
 	rf.state = Follower
-
+	rf.snapshotIndex = -1
+	rf.snapshotTerm = -1
 	rf.nextIndex = make([]int, len(peers))
 	for i := range rf.nextIndex {
 		rf.nextIndex[i] = 0
